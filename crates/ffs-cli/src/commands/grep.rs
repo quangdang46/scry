@@ -8,6 +8,7 @@ use memchr::memmem;
 use serde::Serialize;
 
 use crate::cli::OutputFormat;
+use crate::commands::pagination::footer;
 
 /// Read a file's bytes for searching: single open, single read_to_end (one
 /// syscall, no second `File::open`, no per-file metadata syscall).
@@ -100,7 +101,9 @@ EXAMPLES:
   ffs grep -F '.is_file()'                 # force literal — '.' won't be a regex wildcard
   ffs grep --regex 'fn\\s+\\w+\\(' --root crates/  # signature-style regex over a sub-tree
   ffs grep -w error                        # whole-word match only
-  ffs grep -l fixme                        # files-with-matches mode (one path per line)")]
+  ffs grep -l fixme                        # files-with-matches mode (one path per line)
+  ffs grep -C 2 handleSubmit                # 2 lines of context before/after each match
+  ffs grep TODO --offset 200                # page past the first 200 matches")]
 pub struct Args {
     /// Pattern. Auto-detected as a regular expression when it contains any
     /// regex metacharacter (`.`, `*`, `+`, `?`, `^`, `$`, `[`, `(`, `|`, `\`).
@@ -111,6 +114,12 @@ pub struct Args {
     /// Maximum lines emitted total across all files.
     #[arg(long, default_value_t = 200)]
     pub limit: usize,
+
+    /// Skip this many matches before starting the page. Use together with
+    /// `--limit` to page past a truncated result set (see the `[N-M of
+    /// total]` footer).
+    #[arg(long, default_value_t = 0)]
+    pub offset: usize,
 
     /// Match case sensitively (default: false / smart-case when unset).
     #[arg(short = 's', long)]
@@ -139,6 +148,36 @@ pub struct Args {
     /// Group matches by file and enclosing symbol (like agentgrep).
     #[arg(long)]
     pub group: bool,
+
+    /// Lines of context to show after each match (like `rg -A`).
+    #[arg(short = 'A', long = "after-context", default_value_t = 0)]
+    pub after_context: usize,
+
+    /// Lines of context to show before each match (like `rg -B`).
+    #[arg(short = 'B', long = "before-context", default_value_t = 0)]
+    pub before_context: usize,
+
+    /// Lines of context to show before AND after each match (like `rg -C`).
+    /// Overridden per-side by `--after-context`/`--before-context` if those
+    /// are also given.
+    #[arg(short = 'C', long = "context", default_value_t = 0)]
+    pub context: usize,
+}
+
+impl Args {
+    fn context_lines(&self) -> (usize, usize) {
+        let before = if self.before_context > 0 {
+            self.before_context
+        } else {
+            self.context
+        };
+        let after = if self.after_context > 0 {
+            self.after_context
+        } else {
+            self.context
+        };
+        (before, after)
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +189,14 @@ struct GrepHit {
     /// highlighting. Omitted from JSON when empty (e.g. `-l` mode).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     match_ranges: Vec<(u32, u32)>,
+    /// Lines immediately before `line`, in file order. Only populated when
+    /// `-B`/`-C` was requested.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    context_before: Vec<String>,
+    /// Lines immediately after `line`, in file order. Only populated when
+    /// `-A`/`-C` was requested.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    context_after: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,6 +206,16 @@ struct GrepResult {
     total_files_searched: usize,
     /// "literal" or "regex" — whichever matcher actually ran.
     mode: &'static str,
+    /// Matches skipped before this page (`--offset`).
+    offset: usize,
+    /// True when at least one more match exists beyond this page. Because
+    /// the walk stops scanning as soon as `offset + limit` matches are
+    /// found (to keep large repos fast), `total_matches_at_least` is exact
+    /// only when `truncated` is false — otherwise it's a lower bound.
+    truncated: bool,
+    /// Number of matches found up to the `offset + limit` cutoff. Exact
+    /// total when `truncated` is false; a lower bound otherwise.
+    total_matches_at_least: usize,
     schema: &'static str,
 }
 
@@ -435,6 +492,12 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
     // walk the tree twice.
     let total_files: usize = bigram.as_ref().map_or(usize::MAX, |idx| idx.file_count());
     let limit = args.limit;
+    let offset = args.offset;
+    // The walk stops as soon as `take` matches are found rather than `limit`,
+    // so a page past the first one (`--offset`) doesn't force a full re-scan
+    // of everything before it — we just scan a little further and slice.
+    let take = offset.saturating_add(limit);
+    let (before_context, after_context) = args.context_lines();
     let max_count = if args.max_count == 0 {
         usize::MAX
     } else {
@@ -465,7 +528,8 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
         let candidate_paths = &candidate_paths;
         let bigram_idx = &bigram_idx;
         let files_with_matches = args.files_with_matches;
-        let (limit, max_count) = (limit, max_count);
+        let (take, max_count) = (take, max_count);
+        let (before_context, after_context) = (before_context, after_context);
         Box::new(move |entry| {
             if stop.load(Ordering::Relaxed) {
                 return ignore::WalkState::Quit;
@@ -509,12 +573,12 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
                 };
                 if matched {
                     let prior = hit_counter.fetch_add(1, Ordering::Relaxed);
-                    if prior >= limit {
+                    if prior >= take {
                         stop.store(true, Ordering::Relaxed);
                         return ignore::WalkState::Quit;
                     }
                     if let Ok(mut guard) = hits_mutex.lock() {
-                        if guard.len() >= limit {
+                        if guard.len() >= take {
                             stop.store(true, Ordering::Relaxed);
                             return ignore::WalkState::Quit;
                         }
@@ -523,6 +587,8 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
                             line: 0,
                             text: String::new(),
                             match_ranges: Vec::new(),
+                            context_before: Vec::new(),
+                            context_after: Vec::new(),
                         });
                     }
                 }
@@ -586,25 +652,55 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
                 return ignore::WalkState::Continue;
             }
 
+            // Only split into a line vec when context was actually requested —
+            // it's an extra pass over the file that most callers don't need.
+            let file_lines: Vec<&str> = if before_context > 0 || after_context > 0 {
+                std::str::from_utf8(&content)
+                    .map(|s| s.lines().collect())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let context_slice = |line: u32, before: usize, after: usize| -> (Vec<String>, Vec<String>) {
+                if file_lines.is_empty() {
+                    return (Vec::new(), Vec::new());
+                }
+                let idx = line.saturating_sub(1) as usize; // 0-based
+                let start = idx.saturating_sub(before);
+                let ctx_before = file_lines[start..idx].iter().map(|s| s.to_string()).collect();
+                let end = (idx + 1 + after).min(file_lines.len());
+                let ctx_after = file_lines[(idx + 1).min(file_lines.len())..end]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                (ctx_before, ctx_after)
+            };
+
             let local_hits: Vec<GrepHit> = by_line
                 .into_iter()
-                .map(|(line, (text, match_ranges))| GrepHit {
-                    path: path.to_string_lossy().into_owned(),
-                    line,
-                    text,
-                    match_ranges,
+                .map(|(line, (text, match_ranges))| {
+                    let (context_before, context_after) =
+                        context_slice(line, before_context, after_context);
+                    GrepHit {
+                        path: path.to_string_lossy().into_owned(),
+                        line,
+                        text,
+                        match_ranges,
+                        context_before,
+                        context_after,
+                    }
                 })
                 .collect();
 
             let prior = hit_counter.fetch_add(local_hits.len(), Ordering::Relaxed);
-            if prior >= limit {
+            if prior >= take {
                 stop.store(true, Ordering::Relaxed);
                 return ignore::WalkState::Quit;
             }
 
             if let Ok(mut guard) = hits_mutex.lock() {
                 for h in local_hits {
-                    if guard.len() >= limit {
+                    if guard.len() >= take {
                         stop.store(true, Ordering::Relaxed);
                         return ignore::WalkState::Quit;
                     }
@@ -617,7 +713,10 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
 
     let mut hits = hits_mutex.into_inner().unwrap_or_default();
     hits.sort_by(|a, b| a.path.cmp(&b.path).then(a.line.cmp(&b.line)));
-    hits.truncate(limit);
+    // We stopped scanning at `take` (= offset + limit), so anything found up
+    // to that cutoff is either the exact total (fewer than `take`) or a lower
+    // bound on it (exactly `take`, meaning more may exist past the cutoff).
+    hits.truncate(take);
 
     if args.files_with_matches {
         let mut paths: Vec<String> = hits.iter().map(|h| h.path.clone()).collect();
@@ -630,8 +729,24 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
                 line: 0,
                 text: String::new(),
                 match_ranges: Vec::new(),
+                context_before: Vec::new(),
+                context_after: Vec::new(),
             })
             .collect();
+    }
+
+    // `total_matches_at_least` / `truncated` describe what we know *before*
+    // slicing off `--offset`: how many matches existed up to the `take`
+    // cutoff. `truncated` is true when we hit that cutoff exactly, meaning
+    // there may be more beyond it that we deliberately didn't scan for.
+    let total_matches_at_least = hits.len();
+    let truncated = hits.len() >= take;
+    if offset > 0 {
+        hits = if offset >= hits.len() {
+            Vec::new()
+        } else {
+            hits.split_off(offset)
+        };
     }
 
     // When --group is set, emit symbol-grouped output instead
@@ -671,11 +786,15 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
         total_files
     };
 
+    let returned = hits.len();
     let payload = GrepResult {
         needle: args.needle,
         hits,
         total_files_searched: total_files,
         mode,
+        offset,
+        truncated,
+        total_matches_at_least,
         schema: "v1",
     };
     super::emit(format, &payload, |p| {
@@ -687,18 +806,41 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
                 out.push_str(&super::render::colorize(&h.path, &path_spec));
                 out.push('\n');
             } else {
+                for c in &h.context_before {
+                    out.push_str(&super::render::colorize(&h.path, &path_spec));
+                    out.push('-');
+                    out.push_str(c);
+                    out.push('\n');
+                }
                 out.push_str(&super::render::colorize(&h.path, &path_spec));
                 out.push(':');
                 out.push_str(&super::render::colorize(&h.line.to_string(), &line_spec));
                 out.push_str(": ");
                 out.push_str(&super::render::colorize_matches(&h.text, &h.match_ranges));
                 out.push('\n');
+                for c in &h.context_after {
+                    out.push_str(&super::render::colorize(&h.path, &path_spec));
+                    out.push('-');
+                    out.push_str(c);
+                    out.push('\n');
+                }
+                if !h.context_before.is_empty() || !h.context_after.is_empty() {
+                    out.push_str("--\n");
+                }
             }
         }
         if p.hits.is_empty() {
             out.push_str(&format!(
                 "[no matches across {} files]\n",
                 p.total_files_searched
+            ));
+        } else {
+            let has_more = p.truncated || p.offset + returned < p.total_matches_at_least;
+            out.push_str(&footer(
+                p.total_matches_at_least,
+                p.offset,
+                returned,
+                has_more,
             ));
         }
         out
