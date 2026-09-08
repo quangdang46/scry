@@ -207,7 +207,8 @@ fn tools_list() -> Value {
             json!({
                 "query": {"type": "string", "description": "Text to find in file contents."},
                 "needle": {"type": "string", "description": "Alias for `query` to match the CLI flag name."},
-                "maxResults": {"type": "integer", "minimum": 1, "description": "Maximum matching lines to return."}
+                "maxResults": {"type": "integer", "minimum": 1, "description": "Maximum matching lines to return."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Skip this many matches before starting the page. Use with maxResults to page through large result sets."}
             }),
         ),
         tool(
@@ -227,7 +228,8 @@ fn tools_list() -> Value {
             &["pattern"],
             json!({
                 "pattern": {"type": "string", "description": "Glob pattern, for example src/**/*.rs."},
-                "maxResults": {"type": "integer", "minimum": 1, "description": "Maximum matching paths to return."}
+                "maxResults": {"type": "integer", "minimum": 1, "description": "Maximum matching paths to return."},
+                "offset": {"type": "integer", "minimum": 0, "description": "Skip this many matches before starting the page. Use with maxResults to page through large result sets."}
             }),
         ),
         tool(
