@@ -785,12 +785,11 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
             // once per buffer too — rebuilding per match is O(matches × file)).
             // Skipped outright for files-with-matches mode, which never
             // resolves match offsets to lines — one less scan over the bytes.
-            let newline_index: Option<NewlineIndex> =
-                if files_with_matches || files_without_match {
-                    None
-                } else {
-                    Some(NewlineIndex::build(&content))
-                };
+            let newline_index: Option<NewlineIndex> = if files_with_matches || files_without_match {
+                None
+            } else {
+                Some(NewlineIndex::build(&content))
+            };
             // `line_hits` holds one entry per emitted display row: normally
             // one row per line (matches merged), but `-o` needs one row per
             // *match* even when several land on the same line, so a flat Vec
