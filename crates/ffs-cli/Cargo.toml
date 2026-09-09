@@ -26,6 +26,7 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 clap_complete = "4.5"
 ignore = { workspace = true }
+globset = { workspace = true }
 zlob = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

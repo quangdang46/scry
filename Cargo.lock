@@ -703,6 +703,7 @@ dependencies = [
  "ffs-engine",
  "ffs-search",
  "ffs-symbol",
+ "globset",
  "ignore",
  "libc",
  "memchr",

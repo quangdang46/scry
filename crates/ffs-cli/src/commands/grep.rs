@@ -20,10 +20,42 @@ fn read_for_search(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Push a path-only hit (-l / --files-without-match) with the shared
+/// take/stop accounting. Extracted so the -l fast path and the inverted
+/// variant share one accounting implementation.
+fn push_path_hit(
+    path: &Path,
+    hits_mutex: &Mutex<Vec<GrepHit>>,
+    hit_counter: &AtomicUsize,
+    stop: &std::sync::atomic::AtomicBool,
+    take: usize,
+) {
+    let prior = hit_counter.fetch_add(1, Ordering::Relaxed);
+    if prior >= take {
+        stop.store(true, Ordering::Relaxed);
+        return;
+    }
+    if let Ok(mut guard) = hits_mutex.lock() {
+        if guard.len() >= take {
+            stop.store(true, Ordering::Relaxed);
+            return;
+        }
+        guard.push(GrepHit {
+            path: path.to_string_lossy().into_owned(),
+            line: 0,
+            text: String::new(),
+            match_ranges: Vec::new(),
+            context_before: Vec::new(),
+            context_after: Vec::new(),
+        });
+    }
+}
+
 /// Streaming literal match: searches a file in chunks via BufReader, returning
 /// true at the first match without allocating the full file content. Carries
 /// a small tail overlap between chunks so a match that spans a chunk boundary
 /// is never missed.
+#[allow(dead_code)] // exercised by tests; superseded in the hot path by unified read_for_search
 fn stream_match_literal(path: &Path, needle: &[u8], case_insensitive: bool) -> bool {
     use std::io::{BufReader, Read};
     let file = match std::fs::File::open(path) {
@@ -71,6 +103,7 @@ fn stream_match_literal(path: &Path, needle: &[u8], case_insensitive: bool) -> b
 }
 
 #[inline(always)]
+#[allow(dead_code)] // used by stream_match_literal, currently test-only
 fn find_in_chunk(haystack: &[u8], needle: &[u8], case_insensitive: bool) -> bool {
     if case_insensitive {
         // Case-insensitive: scan for first byte candidates, verify full needle.
@@ -125,6 +158,10 @@ pub struct Args {
     #[arg(short = 's', long)]
     pub case_sensitive: bool,
 
+    /// Match case insensitively, overriding smart-case (like `rg -i`).
+    #[arg(short = 'i', long = "ignore-case", conflicts_with = "case_sensitive")]
+    pub ignore_case: bool,
+
     /// Force regex interpretation (overrides auto-detection).
     #[arg(short = 'r', long)]
     pub regex: bool,
@@ -137,13 +174,50 @@ pub struct Args {
     #[arg(short = 'w', long = "word-regexp")]
     pub word_regexp: bool,
 
+    /// Invert matching: select non-matching lines (like `rg -v`).
+    #[arg(short = 'v', long = "invert-match")]
+    pub invert_match: bool,
+
     /// Stop after N matches per file. 0 = unlimited (default).
     #[arg(long = "max-count", default_value_t = 0)]
     pub max_count: usize,
 
+    /// Shorthand for `--max-count 1` per file (like `rg -m 1`).
+    #[arg(short = 'm', long = "max-count-per-file")]
+    pub max_count_per_file: Option<usize>,
+
     /// Output only the file paths (one per line) — like `rg -l`.
-    #[arg(short = 'l', long = "files-with-matches")]
+    #[arg(
+        short = 'l',
+        long = "files-with-matches",
+        conflicts_with = "files_without_match"
+    )]
     pub files_with_matches: bool,
+
+    /// Output only files with NO match (like `rg --files-without-match`).
+    #[arg(long = "files-without-match")]
+    pub files_without_match: bool,
+
+    /// Search hidden files and directories (like `rg --hidden`).
+    #[arg(long)]
+    pub hidden: bool,
+
+    /// Don't respect `.gitignore` / `.ignore` files (like `rg --no-ignore`).
+    #[arg(long)]
+    pub no_ignore: bool,
+
+    /// Search binary files as if they were text (like `rg -a/--text`).
+    #[arg(short = 'a', long = "text")]
+    pub text: bool,
+
+    /// Include files matching the given glob (repeatable, like `rg -g`).
+    /// Example: `-g '*.rs' -g '!target/**'`.
+    #[arg(short = 'g', long = "glob")]
+    pub globs: Vec<String>,
+
+    /// Only show the matching part of each line (like `rg -o/--only-matching`).
+    #[arg(short = 'o', long = "only-matching")]
+    pub only_matching: bool,
 
     /// Group matches by file and enclosing symbol (like agentgrep).
     #[arg(long)]
@@ -179,6 +253,10 @@ impl Args {
         (before, after)
     }
 }
+
+/// One emitted display row before it's wrapped into a `GrepHit`:
+/// `(line number, display text, match ranges within that text)`.
+type LineHit = (u32, String, Vec<(u32, u32)>);
 
 #[derive(Debug, Serialize)]
 struct GrepHit {
@@ -219,6 +297,73 @@ struct GrepResult {
     schema: &'static str,
 }
 
+/// Include/exclude glob filter from `-g` patterns (rg semantics):
+/// `!`-prefixed patterns are excludes, the rest are includes. A file passes
+/// when it matches no exclude AND (there are no includes OR it matches an
+/// include). Matching is against the path relative to the search root, with
+/// a basename fallback so `-g '*.rs'` matches at any depth.
+struct GlobFilter {
+    includes: globset::GlobSet,
+    excludes: globset::GlobSet,
+    has_includes: bool,
+    has_excludes: bool,
+}
+
+fn build_glob_filter(patterns: &[String]) -> Result<Option<GlobFilter>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut inc = globset::GlobSetBuilder::new();
+    let mut exc = globset::GlobSetBuilder::new();
+    let mut has_includes = false;
+    let mut has_excludes = false;
+    for p in patterns {
+        let (neg, pat) = match p.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, p.as_str()),
+        };
+        let mut gb = globset::GlobBuilder::new(pat);
+        gb.literal_separator(true);
+        let g = gb
+            .build()
+            .map_err(|e| anyhow::anyhow!("invalid glob {p:?}: {e}"))?;
+        if neg {
+            exc.add(g);
+            has_excludes = true;
+        } else {
+            inc.add(g);
+            has_includes = true;
+        }
+    }
+    Ok(Some(GlobFilter {
+        includes: inc
+            .build()
+            .map_err(|e| anyhow::anyhow!("glob set build failed: {e}"))?,
+        excludes: exc
+            .build()
+            .map_err(|e| anyhow::anyhow!("glob set build failed: {e}"))?,
+        has_includes,
+        has_excludes,
+    }))
+}
+
+impl GlobFilter {
+    fn matches(&self, root: &Path, path: &Path) -> bool {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let file_name = path.file_name().map(Path::new);
+        let hit = |set: &globset::GlobSet| {
+            set.is_match(rel) || file_name.is_some_and(|f| set.is_match(f)) || set.is_match(path)
+        };
+        if self.has_excludes && hit(&self.excludes) {
+            return false;
+        }
+        if self.has_includes {
+            return hit(&self.includes);
+        }
+        true
+    }
+}
+
 /// Auto-detect: looks like a regex if it contains any of `.+*?^$[(|\` characters.
 /// Mirrors the heuristic in `ffs::grep::has_regex_metacharacters` so CLI and MCP
 /// agree on what a "literal" query looks like.
@@ -242,10 +387,13 @@ enum Matcher {
 
 impl Matcher {
     fn build(args: &Args) -> Result<(Self, &'static str)> {
-        // Smart case: case_sensitive flag forces sensitive; otherwise we look
-        // at the pattern to decide. Pattern with any uppercase => sensitive.
-        let smart_case_sensitive =
-            args.case_sensitive || args.needle.chars().any(|c| c.is_uppercase());
+        // Smart case: -s forces sensitive, -i forces insensitive; otherwise
+        // a pattern with any uppercase => sensitive (rg --smart-case).
+        let smart_case_sensitive = if args.ignore_case {
+            false
+        } else {
+            args.case_sensitive || args.needle.chars().any(|c| c.is_uppercase())
+        };
 
         let use_regex = args.regex || (!args.fixed_strings && looks_like_regex(&args.needle));
 
@@ -470,16 +618,19 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
     // force-scanned even if not candidates, so the prefilter never false-
     // negatives. We therefore carry (candidates, index) — the index only to
     // answer "is this file current?".
-    let (candidate_paths, bigram_idx): (
+    type BigramOrdinals<'a> = std::collections::HashMap<&'a Path, usize>;
+    let (candidate_paths, bigram_idx, bigram_ordinals): (
         Option<std::collections::HashSet<PathBuf>>,
         Option<&crate::bigram::GrepBigram>,
+        Option<BigramOrdinals>,
     ) = match &bigram {
         Some(idx) => (
             idx.filter(needle_bytes)
                 .map(|paths| paths.into_iter().map(PathBuf::from).collect()),
             Some(idx),
+            Some(idx.ordinal_map()),
         ),
-        None => (None, None),
+        None => (None, None, None),
     };
     // NOTE: we deliberately do NOT short-circuit when the candidate set is
     // empty. Files added since indexing are force-scanned by the walk (they
@@ -498,11 +649,19 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
     // of everything before it — we just scan a little further and slice.
     let take = offset.saturating_add(limit);
     let (before_context, after_context) = args.context_lines();
-    let max_count = if args.max_count == 0 {
-        usize::MAX
-    } else {
-        args.max_count
+    // -m N is shorthand for --max-count N (rg semantics); explicit
+    // --max-count wins when both are given.
+    let max_count = match (args.max_count, args.max_count_per_file) {
+        (0, None) => usize::MAX,
+        (0, Some(m)) => m,
+        (c, _) => c,
     };
+    let invert_match = args.invert_match;
+    let only_matching = args.only_matching;
+    let search_text = args.text;
+    let files_without_match = args.files_without_match;
+    let files_with_matches = args.files_with_matches;
+    let globs = build_glob_filter(&args.globs)?;
 
     let hits_mutex: Mutex<Vec<GrepHit>> = Mutex::new(Vec::new());
     let hit_counter = AtomicUsize::new(0);
@@ -514,11 +673,21 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
         .unwrap_or(2)
         .min(8);
 
-    let walker = ignore::WalkBuilder::new(root)
-        .standard_filters(true)
-        .follow_links(false)
-        .threads(threads)
-        .build_parallel();
+    // rg parity: --hidden disables the hidden-file filter, --no-ignore
+    // disables gitignore/.ignore handling. `standard_filters(true)` is
+    // equivalent to hidden=false + ignore=true + git-ignore=true, so expand
+    // it explicitly to honor the flags.
+    let walker = {
+        let mut b = ignore::WalkBuilder::new(root);
+        b.hidden(!args.hidden)
+            .git_ignore(!args.no_ignore)
+            .git_exclude(!args.no_ignore)
+            .git_global(!args.no_ignore)
+            .ignore(!args.no_ignore)
+            .follow_links(false)
+            .threads(threads);
+        b.build_parallel()
+    };
     walker.run(|| {
         let matcher = &matcher;
         let hits_mutex = &hits_mutex;
@@ -527,9 +696,13 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
         let stop = &stop;
         let candidate_paths = &candidate_paths;
         let bigram_idx = &bigram_idx;
-        let files_with_matches = args.files_with_matches;
+        let bigram_ordinals = &bigram_ordinals;
+        let globs = &globs;
+        let root = root.to_path_buf();
         let (take, max_count) = (take, max_count);
         let (before_context, after_context) = (before_context, after_context);
+        let (invert_match, only_matching, search_text) = (invert_match, only_matching, search_text);
+        let (files_with_matches, files_without_match) = (files_with_matches, files_without_match);
         Box::new(move |entry| {
             if stop.load(Ordering::Relaxed) {
                 return ignore::WalkState::Quit;
@@ -543,81 +716,138 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
             // Count every file we visit (only used when there's no cache, to
             // derive the bug-18 denominator without a second walk).
             file_counter.fetch_add(1, Ordering::Relaxed);
+            // Grab metadata from the DirEntry *before* consuming it via
+            // into_path() — on Windows this is served from the walker's
+            // cached FindNextFile attributes, not a fresh stat, so the
+            // bigram freshness check below costs no extra syscall. Only
+            // fetched when a bigram prefilter is actually active.
+            let entry_metadata = if candidate_paths.is_some() {
+                e.metadata().ok()
+            } else {
+                None
+            };
             let path = e.into_path();
+            // -g include/exclude filter (rg semantics) before any I/O.
+            if let Some(gf) = globs {
+                if !gf.matches(&root, &path) {
+                    return ignore::WalkState::Continue;
+                }
+            }
             // Bigram prefilter: skip a file only when it is (a) not a
             // candidate AND (b) provably unchanged since indexing. A file
             // added or edited since indexing (even in place) may contain the
             // needle, so it is force-scanned — this is what keeps the prefilter
             // free of false negatives.
             if let Some(cands) = candidate_paths {
-                if !cands.contains(&path) && bigram_idx.is_some_and(|idx| idx.is_current(&path)) {
+                let current = match (bigram_idx, bigram_ordinals, &entry_metadata) {
+                    (Some(idx), Some(ord), Some(meta)) => {
+                        idx.is_current_with_metadata(&path, ord, meta)
+                    }
+                    (Some(idx), Some(ord), None) => idx.is_current_at(&path, ord),
+                    _ => false,
+                };
+                if !cands.contains(&path) && current {
                     return ignore::WalkState::Continue;
                 }
-            }
-
-            // files-with-matches: only need to know IF the file matches.
-            // For literal patterns, use streaming BufReader — avoids allocating
-            // the full file content and stops at the first match.
-            if files_with_matches {
-                let matched = match &matcher {
-                    Matcher::Literal {
-                        needle,
-                        case_insensitive,
-                    } => stream_match_literal(&path, needle, *case_insensitive),
-                    _ => {
-                        let Ok(content) = read_for_search(&path) else {
-                            return ignore::WalkState::Continue;
-                        };
-                        matcher.is_match(&content)
-                    }
-                };
-                if matched {
-                    let prior = hit_counter.fetch_add(1, Ordering::Relaxed);
-                    if prior >= take {
-                        stop.store(true, Ordering::Relaxed);
-                        return ignore::WalkState::Quit;
-                    }
-                    if let Ok(mut guard) = hits_mutex.lock() {
-                        if guard.len() >= take {
-                            stop.store(true, Ordering::Relaxed);
-                            return ignore::WalkState::Quit;
-                        }
-                        guard.push(GrepHit {
-                            path: path.to_string_lossy().into_owned(),
-                            line: 0,
-                            text: String::new(),
-                            match_ranges: Vec::new(),
-                            context_before: Vec::new(),
-                            context_after: Vec::new(),
-                        });
-                    }
-                }
-                return ignore::WalkState::Continue;
             }
 
             let Ok(content) = read_for_search(&path) else {
                 return ignore::WalkState::Continue;
             };
 
-            // Quick binary heuristic: skip files containing NUL in the first 8KB.
+            // Binary heuristic (rg skips NUL-containing files unless -a/--text).
             let probe = &content[..content.len().min(8 * 1024)];
-            if probe.contains(&0u8) {
+            if !search_text && probe.contains(&0u8) {
                 return ignore::WalkState::Continue;
             }
 
-            // Collect matches keyed by line so multiple matches on the same
-            // line become a single hit carrying ALL match ranges.
-            let mut by_line: std::collections::BTreeMap<u32, (String, Vec<(u32, u32)>)> =
-                std::collections::BTreeMap::new();
-            for (per_file, (off, end)) in matcher.find_iter(&content).enumerate() {
-                if per_file >= max_count {
-                    break;
+            // files-with-matches / files-without-match: only need IF it matches.
+            if files_with_matches || files_without_match {
+                let matched = matcher.is_match(&content);
+                let emit = if files_without_match {
+                    !matched
+                } else {
+                    matched
+                };
+                if invert_match {
+                    // -v inverts the -l/--files-without-match sense too.
+                    let emit = !emit;
+                    if emit {
+                        push_path_hit(&path, hits_mutex, hit_counter, stop, take);
+                    }
+                } else if emit {
+                    push_path_hit(&path, hits_mutex, hit_counter, stop, take);
                 }
-                let newline_index = NewlineIndex::build(&content);
-                let (line, line_start, slice) = newline_index.byte_to_line(&content, off);
-                // Bug 16: multiline match → render the whole span.
-                let (text, range) =
-                    if end > off && end <= content.len() && content[off..end].contains(&b'\n') {
+                return ignore::WalkState::Continue;
+            }
+
+            // Newline index built once per file (rg builds its line table
+            // once per buffer too — rebuilding per match is O(matches × file)).
+            // Skipped outright for files-with-matches mode, which never
+            // resolves match offsets to lines — one less scan over the bytes.
+            let newline_index: Option<NewlineIndex> =
+                if files_with_matches || files_without_match {
+                    None
+                } else {
+                    Some(NewlineIndex::build(&content))
+                };
+            // `line_hits` holds one entry per emitted display row: normally
+            // one row per line (matches merged), but `-o` needs one row per
+            // *match* even when several land on the same line, so a flat Vec
+            // (sorted by line at the end) replaces the old by-line map, which
+            // could only hold a single row per line.
+            let mut line_hits: Vec<LineHit> = Vec::new();
+            let newline_index = newline_index
+                .as_ref()
+                .expect("built above whenever a line-resolving branch runs");
+            if invert_match {
+                // -v: every NON-matching line is a hit (rg semantics).
+                let matched_lines: std::collections::HashSet<u32> = matcher
+                    .find_iter(&content)
+                    .map(|(off, _)| newline_index.byte_to_line(&content, off).0)
+                    .collect();
+                let text = String::from_utf8_lossy(&content);
+                for (idx, line_text) in text.lines().enumerate() {
+                    let line = (idx + 1) as u32;
+                    if matched_lines.contains(&line) {
+                        continue;
+                    }
+                    line_hits.push((line, line_text.to_string(), Vec::new()));
+                    if line_hits.len() >= max_count {
+                        break;
+                    }
+                }
+            } else if only_matching {
+                // -o: one row per match, showing only the matched text.
+                for (per_file, (off, end)) in matcher.find_iter(&content).enumerate() {
+                    if per_file >= max_count {
+                        break;
+                    }
+                    let (line, _, _) = newline_index.byte_to_line(&content, off);
+                    let snippet = &content[off.min(content.len())..end.min(content.len())];
+                    let text = String::from_utf8_lossy(snippet).replace('\n', "\\n");
+                    let range = if text.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![(0, text.len() as u32)]
+                    };
+                    line_hits.push((line, text, range));
+                }
+            } else {
+                // Default: merge same-line matches into one row carrying all
+                // their ranges, keyed by line number.
+                let mut by_line: std::collections::BTreeMap<u32, (String, Vec<(u32, u32)>)> =
+                    std::collections::BTreeMap::new();
+                for (per_file, (off, end)) in matcher.find_iter(&content).enumerate() {
+                    if per_file >= max_count {
+                        break;
+                    }
+                    let (line, line_start, slice) = newline_index.byte_to_line(&content, off);
+                    // Bug 16: multiline match → render the whole span.
+                    let (text, range) = if end > off
+                        && end <= content.len()
+                        && content[off..end].contains(&b'\n')
+                    {
                         let snippet = &content[off..end];
                         let text = String::from_utf8_lossy(snippet).replace('\n', "\\n");
                         let range = if text.is_empty() {
@@ -638,17 +868,18 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
                         };
                         (text, range)
                     };
-                let entry = by_line.entry(line).or_insert_with(|| (text, Vec::new()));
-                if let Some(r) = range {
-                    entry.1.push(r);
+                    let entry = by_line.entry(line).or_insert_with(|| (text, Vec::new()));
+                    if let Some(r) = range {
+                        entry.1.push(r);
+                    }
                 }
-                // files-with-matches: first match per file is enough.
-                if files_with_matches {
-                    break;
-                }
+                line_hits = by_line
+                    .into_iter()
+                    .map(|(line, (text, ranges))| (line, text, ranges))
+                    .collect();
             }
 
-            if by_line.is_empty() {
+            if line_hits.is_empty() {
                 return ignore::WalkState::Continue;
             }
 
@@ -661,24 +892,28 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
             } else {
                 Vec::new()
             };
-            let context_slice = |line: u32, before: usize, after: usize| -> (Vec<String>, Vec<String>) {
-                if file_lines.is_empty() {
-                    return (Vec::new(), Vec::new());
-                }
-                let idx = line.saturating_sub(1) as usize; // 0-based
-                let start = idx.saturating_sub(before);
-                let ctx_before = file_lines[start..idx].iter().map(|s| s.to_string()).collect();
-                let end = (idx + 1 + after).min(file_lines.len());
-                let ctx_after = file_lines[(idx + 1).min(file_lines.len())..end]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                (ctx_before, ctx_after)
-            };
+            let context_slice =
+                |line: u32, before: usize, after: usize| -> (Vec<String>, Vec<String>) {
+                    if file_lines.is_empty() {
+                        return (Vec::new(), Vec::new());
+                    }
+                    let idx = line.saturating_sub(1) as usize; // 0-based
+                    let start = idx.saturating_sub(before);
+                    let ctx_before = file_lines[start..idx]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    let end = (idx + 1 + after).min(file_lines.len());
+                    let ctx_after = file_lines[(idx + 1).min(file_lines.len())..end]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    (ctx_before, ctx_after)
+                };
 
-            let local_hits: Vec<GrepHit> = by_line
+            let local_hits: Vec<GrepHit> = line_hits
                 .into_iter()
-                .map(|(line, (text, match_ranges))| {
+                .map(|(line, text, match_ranges)| {
                     let (context_before, context_after) =
                         context_slice(line, before_context, after_context);
                     GrepHit {

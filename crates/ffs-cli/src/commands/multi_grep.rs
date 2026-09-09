@@ -97,23 +97,38 @@ fn collect_patterns(args: &Args) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn byte_to_line(haystack: &[u8], offset: usize) -> (u32, usize, &[u8]) {
-    let mut line = 1u32;
-    let mut line_start = 0usize;
-    let mut i = 0;
-    while i < offset {
-        if haystack[i] == b'\n' {
-            line += 1;
-            line_start = i + 1;
+/// Precomputed newline index for O(log n) byte-to-line mapping — avoids the
+/// O(offset) linear rescan-from-zero that a naive `byte_to_line` would do for
+/// every match (quadratic on hit-dense files). Built once per file.
+struct NewlineIndex {
+    positions: Vec<usize>,
+}
+
+impl NewlineIndex {
+    fn build(haystack: &[u8]) -> Self {
+        Self {
+            positions: memchr::memchr_iter(b'\n', haystack).collect(),
         }
-        i += 1;
     }
-    let line_end = haystack[line_start..]
-        .iter()
-        .position(|&b| b == b'\n')
-        .map(|p| line_start + p)
-        .unwrap_or(haystack.len());
-    (line, line_start, &haystack[line_start..line_end])
+
+    fn byte_to_line<'a>(&self, haystack: &'a [u8], offset: usize) -> (u32, usize, &'a [u8]) {
+        let idx = match self.positions.binary_search(&offset) {
+            Ok(i) => i + 1,
+            Err(i) => i,
+        };
+        let line = (idx + 1) as u32;
+        let line_start = if idx == 0 {
+            0
+        } else {
+            self.positions[idx - 1] + 1
+        };
+        let line_end = haystack[line_start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map(|p| line_start + p)
+            .unwrap_or(haystack.len());
+        (line, line_start, &haystack[line_start..line_end])
+    }
 }
 
 pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
@@ -163,11 +178,12 @@ pub fn run(args: Args, root: &Path, format: OutputFormat) -> Result<()> {
         let mut by_line: std::collections::BTreeMap<u32, LineHits> =
             std::collections::BTreeMap::new();
 
+        let newline_index = NewlineIndex::build(&content);
         for (per_file, mat) in ac.find_iter(&content).enumerate() {
             if per_file >= max_count {
                 break;
             }
-            let (line, line_start, slice) = byte_to_line(&content, mat.start());
+            let (line, line_start, slice) = newline_index.byte_to_line(&content, mat.start());
             let pat = patterns[mat.pattern().as_usize()].clone();
             let entry = by_line.entry(line).or_insert_with(|| {
                 (

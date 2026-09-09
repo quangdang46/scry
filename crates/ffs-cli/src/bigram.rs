@@ -166,6 +166,18 @@ impl GrepBigram {
         Some(survivors)
     }
 
+    /// Build a path → ordinal map once per grep invocation, so per-file
+    /// currency checks stay O(1). The previous linear `position()` scan made
+    /// the hot path O(files) per visited file — O(files²) compares on the walk.
+    #[must_use]
+    pub fn ordinal_map(&self) -> HashMap<&Path, usize> {
+        let mut map = HashMap::with_capacity(self.paths.len() * 2);
+        for (idx, p) in self.paths.iter().enumerate() {
+            map.insert(p.as_path(), idx);
+        }
+        map
+    }
+
     /// True when `path` is one of the indexed files whose fingerprint
     /// (mtime, size) still matches what was recorded at index time.
     ///
@@ -175,16 +187,52 @@ impl GrepBigram {
     /// unknown": the caller force-scans it regardless of the candidate set.
     /// This guarantees the prefilter never skips a file that could contain the
     /// pattern.
+    ///
+    /// Prefer [`GrepBigram::is_current_at`] with a prebuilt
+    /// [`GrepBigram::ordinal_map`] on hot paths — this convenience wrapper
+    /// builds the map per call (O(files)) and is only for tests / cold paths.
     #[must_use]
+    #[allow(dead_code)] // test/cold-path convenience wrapper around is_current_at
     pub fn is_current(&self, path: &Path) -> bool {
-        let Some(idx) = self.paths.iter().position(|p| p.as_path() == path) else {
+        let map = self.ordinal_map();
+        self.is_current_at(path, &map)
+    }
+
+    /// Ordinal-map variant of [`GrepBigram::is_current`]: O(1) map lookup +
+    /// one stat, no per-call map build. Pass the map from `ordinal_map()`.
+    ///
+    /// Prefer [`GrepBigram::is_current_with_metadata`] when the caller
+    /// already has `Metadata` in hand (e.g. from a directory walker) — it
+    /// avoids this method's extra `stat` syscall per file.
+    #[must_use]
+    #[allow(dead_code)] // convenience wrapper; hot path uses is_current_with_metadata
+    pub fn is_current_at(&self, path: &Path, ordinals: &HashMap<&Path, usize>) -> bool {
+        let Some(meta) = std::fs::metadata(path).ok() else {
+            return false;
+        };
+        self.is_current_with_metadata(path, ordinals, &meta)
+    }
+
+    /// Like [`GrepBigram::is_current_at`] but takes `Metadata` the caller
+    /// already fetched — e.g. `ignore::DirEntry::metadata()`, which on
+    /// Windows is served from the `FindNextFile` attributes cached by the
+    /// walker rather than a fresh `stat`. Avoiding a second per-file stat
+    /// call here matters once the walk visits thousands of files.
+    #[must_use]
+    pub fn is_current_with_metadata(
+        &self,
+        path: &Path,
+        ordinals: &HashMap<&Path, usize>,
+        meta: &std::fs::Metadata,
+    ) -> bool {
+        let Some(&idx) = ordinals.get(path) else {
             // Not in the index → added since indexing → stale/unknown content.
             return false;
         };
         let Some(recorded) = self.fingerprints.get(idx) else {
             return false;
         };
-        file_fingerprint(path).as_ref() == Some(recorded)
+        fingerprint_from_metadata(meta).as_ref() == Some(recorded)
     }
 }
 
@@ -193,6 +241,12 @@ impl GrepBigram {
 /// means the file may contain new bigrams and must be force-scanned.
 fn file_fingerprint(path: &Path) -> Option<FileFingerprint> {
     let meta = std::fs::metadata(path).ok()?;
+    Some(fingerprint_from_metadata(&meta).unwrap_or((0, meta.len())))
+}
+
+/// Derive `(mtime_secs, len)` from an already-fetched `Metadata`, without a
+/// fresh `stat` call.
+fn fingerprint_from_metadata(meta: &std::fs::Metadata) -> Option<FileFingerprint> {
     let mtime = meta
         .modified()
         .ok()
