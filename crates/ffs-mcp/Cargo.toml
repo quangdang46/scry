@@ -1,6 +1,6 @@
 [package]
 name = "ffs-mcp"
-version = "0.1.25"
+version = "0.1.26"
 edition = "2024"
 license = "MIT"
 description = "MCP server for ffs file finder — drop-in replacement for AI code assistant search tools"

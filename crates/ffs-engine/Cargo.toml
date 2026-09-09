@@ -1,6 +1,6 @@
 [package]
 name = "ffs-engine"
-version = "0.1.25"
+version = "0.1.26"
 edition = "2021"
 license = "MIT"
 description = "Unified scanner, query dispatch, ranking and memory-budget enforcement for ffs."

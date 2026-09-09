@@ -1,6 +1,6 @@
 [package]
 name = "ffs-cli"
-version = "0.1.25"
+version = "0.1.26"
 edition = "2021"
 license = "MIT"
 description = "Command line interface for ffs — unified code search and read tool."

@@ -1,6 +1,6 @@
 [package]
 name = "ffs-query-parser"
-version = "0.1.25"
+version = "0.1.26"
 edition = "2024"
 license = "MIT"
 description = "Query parser for ffs file finder — includes specific syntax for various constraints like globs, extensions, regex etc"

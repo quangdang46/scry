@@ -1,6 +1,6 @@
 [package]
 name = "ffs-symbol"
-version = "0.1.25"
+version = "0.1.26"
 edition = "2021"
 license = "MIT"
 description = "Symbol indexing, bloom filters, and tree-sitter outline extraction for ffs."
